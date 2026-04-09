@@ -6,6 +6,17 @@ This document explains every gRPC-related change made during the migration from 
 
 ## Table of Contents
 
+0. [Setting Up gRPC in a Go Project From Scratch](#0-setting-up-grpc-in-a-go-project-from-scratch)
+   - [0.1 Prerequisites](#01-prerequisites)
+   - [0.2 Install Go Dependencies](#02-install-go-dependencies)
+   - [0.3 Install buf (Protobuf Toolchain)](#03-install-buf-protobuf-toolchain)
+   - [0.4 Create the buf Configuration Files](#04-create-the-buf-configuration-files)
+   - [0.5 Create the Directory Structure](#05-create-the-directory-structure)
+   - [0.6 Write Your First Proto File](#06-write-your-first-proto-file)
+   - [0.7 Generate Go Code](#07-generate-go-code)
+   - [0.8 Implement the Server](#08-implement-the-server)
+   - [0.9 Run and Test](#09-run-and-test)
+   - [0.10 Install Testing Tools](#010-install-testing-tools)
 1. [What is gRPC and Why Use It](#1-what-is-grpc-and-why-use-it)
 2. [How gRPC Differs from REST](#2-how-grpc-differs-from-rest)
 3. [The Toolchain: Protobuf + buf](#3-the-toolchain-protobuf--buf)
@@ -22,6 +33,433 @@ This document explains every gRPC-related change made during the migration from 
 8. [Testing Your gRPC Server](#8-testing-your-grpc-server)
 9. [How to Add a New Service](#9-how-to-add-a-new-service)
 10. [Key Concepts Reference](#10-key-concepts-reference)
+
+---
+
+## 0. Setting Up gRPC in a Go Project From Scratch
+
+This section walks you through every step of adding gRPC to a Go project, starting from nothing. If you're starting a new project or adding gRPC to an existing one, follow these steps in order.
+
+### 0.1 Prerequisites
+
+You need **Go 1.21+** installed. Verify:
+
+```bash
+go version
+# go version go1.25.0 ...
+```
+
+You also need a Go module initialized. If you're starting fresh:
+
+```bash
+mkdir my-grpc-project && cd my-grpc-project
+go mod init example.com/my-grpc-project
+```
+
+If you already have a Go project with `go.mod`, skip this.
+
+### 0.2 Install Go Dependencies
+
+You need two runtime libraries:
+
+```bash
+# The gRPC framework — provides the server, client, and transport layer
+go get google.golang.org/grpc
+
+# The protobuf runtime — provides the generated message types
+go get google.golang.org/protobuf
+```
+
+**What each one does:**
+
+| Package | Purpose | Used where |
+|---------|---------|------------|
+| `google.golang.org/grpc` | gRPC server (`grpc.NewServer()`), client (`grpc.Dial()`), status codes, interceptors | `main.go`, handler files, client code |
+| `google.golang.org/protobuf` | Runtime support for generated protobuf structs (marshal/unmarshal, reflection) | Imported automatically by generated `*.pb.go` files |
+
+After running these, your `go.mod` will include:
+
+```
+require (
+    google.golang.org/grpc v1.79.3
+    google.golang.org/protobuf v1.36.11
+)
+```
+
+Several indirect dependencies will also appear (like `golang.org/x/net` for HTTP/2 support) — these are pulled in automatically, you don't need to manage them.
+
+### 0.3 Install buf (Protobuf Toolchain)
+
+`buf` is the tool that reads your `.proto` files and generates Go code. Install it for your platform:
+
+```bash
+# Windows (winget)
+winget install bufbuild.buf
+
+# macOS (Homebrew)
+brew install bufbuild/buf/buf
+
+# Linux (direct download)
+# See https://buf.build/docs/installation
+
+# Verify installation
+buf --version
+# 1.66.1
+```
+
+**Why buf instead of protoc?**
+
+The older approach uses `protoc` (the protobuf compiler) with manually installed plugins (`protoc-gen-go`, `protoc-gen-go-grpc`). This requires:
+- Installing `protoc` separately
+- Installing each plugin via `go install`
+- Wiring them together with complex command-line flags
+
+`buf` replaces all of that. It downloads plugins automatically (via `remote:` in `buf.gen.yaml`), manages versions, and adds linting and breaking change detection. For reference, here's what the old `protoc` approach looks like — you don't need to do this if you use buf:
+
+```bash
+# OLD WAY (don't do this if you have buf):
+# Install protoc compiler from https://github.com/protocolbuffers/protobuf/releases
+# Install the Go plugins:
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+# Run protoc with flags:
+protoc --go_out=gen/pb --go_opt=paths=source_relative \
+       --go-grpc_out=gen/pb --go-grpc_opt=paths=source_relative \
+       -I api/proto \
+       api/proto/users/v1/users.proto
+```
+
+### 0.4 Create the buf Configuration Files
+
+You need two files in your project root:
+
+**`buf.yaml`** — project-level config. Tells buf where your proto files live:
+
+```yaml
+version: v2
+modules:
+  - path: api/proto
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE
+```
+
+| Field | Meaning |
+|-------|---------|
+| `modules[].path` | Directory containing your `.proto` files. All `import` paths in proto files are relative to this. |
+| `lint.use: [DEFAULT]` | Apply standard protobuf style rules (e.g., field names must be snake_case, service names must be PascalCase). |
+| `breaking.use: [FILE]` | When running `buf breaking`, detect changes that would break existing clients (renamed fields, changed types, etc.). |
+
+**`buf.gen.yaml`** — code generation config. Tells buf what to generate and where:
+
+```yaml
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen/pb
+    opt:
+      - paths=source_relative
+  - remote: buf.build/grpc/go
+    out: gen/pb
+    opt:
+      - paths=source_relative
+```
+
+| Field | Meaning |
+|-------|---------|
+| `plugins[].remote` | The code generation plugin, downloaded from the Buf Schema Registry. No local install needed. |
+| `plugins[].out` | Output directory for generated files. |
+| `plugins[].opt` | Plugin options. `paths=source_relative` means the output directory structure mirrors the proto file directory structure. |
+
+The two plugins and what they generate:
+
+| Plugin | Generated file | Contents |
+|--------|---------------|----------|
+| `buf.build/protocolbuffers/go` | `*.pb.go` | Go structs for each `message`, plus marshal/unmarshal methods |
+| `buf.build/grpc/go` | `*_grpc.pb.go` | Server interface, client stub, and registration function for each `service` |
+
+**Important:** Make sure `gen/` is in your `.gitignore` if you want to regenerate on build, or commit it if you want the project to compile without buf installed. This project commits the generated code.
+
+### 0.5 Create the Directory Structure
+
+```bash
+# Proto source files go here (matches buf.yaml modules[].path)
+mkdir -p api/proto
+
+# Generated code will appear here (matches buf.gen.yaml plugins[].out)
+# Don't create this manually — buf generate creates it
+# mkdir -p gen/pb
+
+# Your handler implementations go here
+mkdir -p internal
+```
+
+The recommended layout for proto files follows this pattern:
+
+```
+api/proto/
+└── <service-name>/
+    └── <version>/
+        └── <service-name>.proto
+```
+
+For example:
+```
+api/proto/
+├── users/v1/users.proto
+├── voids/v1/voids.proto
+├── posts/v1/posts.proto
+└── messages/v1/messages.proto
+```
+
+**Why the `v1` directory?** API versioning. If you need to make breaking changes later, you create `v2/` side by side. Clients on v1 keep working while you migrate them.
+
+### 0.6 Write Your First Proto File
+
+Create `api/proto/greeter/v1/greeter.proto` (a minimal example):
+
+```protobuf
+syntax = "proto3";
+package myproject.greeter.v1;
+
+option go_package = "example.com/my-grpc-project/gen/pb/greeter/v1";
+
+// The service definition — becomes a Go interface
+service GreeterService {
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
+}
+
+// Request message — becomes a Go struct
+message SayHelloRequest {
+  string name = 1;
+}
+
+// Response message — becomes a Go struct
+message SayHelloResponse {
+  string greeting = 1;
+}
+```
+
+**Checklist for every proto file:**
+
+- [ ] `syntax = "proto3";` on line 1
+- [ ] `package` matches directory structure: `<project>.<service>.<version>`
+- [ ] `option go_package` points to where generated code will land (must match `buf.gen.yaml` `out` + directory path)
+- [ ] At least one `service` with at least one `rpc`
+- [ ] Every `rpc` has a dedicated request and response message (even if empty — use `google.protobuf.Empty` for truly empty responses)
+- [ ] Field numbers start at 1 and are unique within each message
+
+### 0.7 Generate Go Code
+
+```bash
+buf generate
+```
+
+That's it. Check the output:
+
+```bash
+ls gen/pb/greeter/v1/
+# greeter.pb.go        <- structs (SayHelloRequest, SayHelloResponse)
+# greeter_grpc.pb.go   <- interface (GreeterServiceServer) + client (NewGreeterServiceClient)
+```
+
+**Common issues:**
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `"api/proto" had no .proto files` | Empty proto directory | Make sure proto files exist in the `modules[].path` directory |
+| `go_package option is missing` | Forgot `option go_package` in proto file | Add the `option go_package = "...";` line |
+| `import "..." not found` | Importing another proto file that doesn't exist | Check the import path is relative to `api/proto/` |
+| `field number X is already used` | Duplicate field numbers in a message | Each field in a message must have a unique number |
+
+**Run this every time you change a `.proto` file.** Forgetting to regenerate is the #1 source of confusion — your Go code will be out of sync with your proto definitions.
+
+### 0.8 Implement the Server
+
+Now you write the actual Go code. There are three pieces:
+
+**Piece 1: The handler** — implements the generated interface
+
+Create `internal/greeter/handler.go`:
+
+```go
+package greeter
+
+import (
+    "context"
+    "fmt"
+
+    greeterpb "example.com/my-grpc-project/gen/pb/greeter/v1"
+)
+
+type Handler struct {
+    greeterpb.UnimplementedGreeterServiceServer // REQUIRED: embed this
+}
+
+func NewHandler() *Handler {
+    return &Handler{}
+}
+
+func (h *Handler) SayHello(ctx context.Context, req *greeterpb.SayHelloRequest) (*greeterpb.SayHelloResponse, error) {
+    return &greeterpb.SayHelloResponse{
+        Greeting: fmt.Sprintf("Hello, %s!", req.GetName()),
+    }, nil
+}
+```
+
+**Piece 2: The main function** — creates and starts the gRPC server
+
+Create `cmd/server/main.go`:
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "net"
+
+    greeterpb "example.com/my-grpc-project/gen/pb/greeter/v1"
+    "example.com/my-grpc-project/internal/greeter"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/reflection"
+)
+
+func main() {
+    // 1. Open a TCP port
+    lis, err := net.Listen("tcp", ":50051")
+    if err != nil {
+        log.Fatalf("failed to listen: %v", err)
+    }
+
+    // 2. Create a gRPC server instance
+    grpcServer := grpc.NewServer()
+
+    // 3. Register your handler
+    greeterpb.RegisterGreeterServiceServer(grpcServer, greeter.NewHandler())
+
+    // 4. Enable reflection (lets grpcurl/evans discover your API)
+    reflection.Register(grpcServer)
+
+    // 5. Start serving
+    fmt.Println("gRPC server listening on :50051")
+    if err := grpcServer.Serve(lis); err != nil {
+        log.Fatalf("failed to serve: %v", err)
+    }
+}
+```
+
+**Piece 3 (optional): A Go client** — for other Go services to call yours
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    greeterpb "example.com/my-grpc-project/gen/pb/greeter/v1"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+func main() {
+    // Connect to the server
+    conn, err := grpc.NewClient("localhost:50051",
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+    )
+    if err != nil {
+        log.Fatalf("failed to connect: %v", err)
+    }
+    defer conn.Close()
+
+    // Create a typed client (generated by buf)
+    client := greeterpb.NewGreeterServiceClient(conn)
+
+    // Call the RPC — just like calling a local function
+    resp, err := client.SayHello(context.Background(), &greeterpb.SayHelloRequest{
+        Name: "World",
+    })
+    if err != nil {
+        log.Fatalf("SayHello failed: %v", err)
+    }
+    fmt.Println(resp.GetGreeting()) // "Hello, World!"
+}
+```
+
+`grpc.WithTransportCredentials(insecure.NewCredentials())` disables TLS — fine for local dev, but use proper TLS in production.
+
+### 0.9 Run and Test
+
+```bash
+# Start the server
+go run ./cmd/server
+
+# In another terminal — test with grpcurl
+grpcurl -plaintext localhost:50051 list
+# myproject.greeter.v1.GreeterService
+
+grpcurl -plaintext -d '{"name": "World"}' \
+  localhost:50051 myproject.greeter.v1.GreeterService/SayHello
+# {
+#   "greeting": "Hello, World!"
+# }
+```
+
+### 0.10 Install Testing Tools
+
+These are optional but highly recommended for development:
+
+```bash
+# grpcurl — like curl, but for gRPC (used in examples above)
+go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+# evans — interactive REPL for gRPC (tab completion, explore services)
+go install github.com/ktr0731/evans@latest
+```
+
+Using evans:
+
+```bash
+evans -r repl -p 50051
+
+# Inside the REPL:
+> show service
+# GreeterService
+> service GreeterService
+# Set target service
+> call SayHello
+# name (TYPE_STRING) => World
+# { "greeting": "Hello, World!" }
+```
+
+### Setup Checklist
+
+Here's everything in one checklist for quick reference:
+
+```
+[ ] Go 1.21+ installed
+[ ] go mod init (if new project)
+[ ] go get google.golang.org/grpc
+[ ] go get google.golang.org/protobuf
+[ ] buf installed (winget install bufbuild.buf / brew install bufbuild/buf/buf)
+[ ] buf.yaml created at project root
+[ ] buf.gen.yaml created at project root
+[ ] api/proto/ directory created
+[ ] At least one .proto file with service + messages
+[ ] buf generate runs without errors
+[ ] gen/pb/ contains generated .pb.go and _grpc.pb.go files
+[ ] Handler struct embeds Unimplemented*Server
+[ ] Handler methods implemented
+[ ] main.go creates grpc.NewServer, registers handler, calls Serve()
+[ ] reflection.Register() called (for dev tooling)
+[ ] go build succeeds
+[ ] grpcurl or evans can list and call your services
+```
 
 ---
 
