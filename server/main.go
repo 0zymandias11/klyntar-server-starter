@@ -4,16 +4,21 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
-	"example.com/klyntar-server/api/routes"
-	"example.com/klyntar-server/app"
+	userspb "example.com/klyntar-server/gen/pb/users/v1"
 	"example.com/klyntar-server/config"
+	"example.com/klyntar-server/internal/users"
 	"example.com/klyntar-server/pkg/cache"
 	"example.com/klyntar-server/pkg/db"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 func main() {
@@ -21,8 +26,6 @@ func main() {
 		AddSource: true,
 	})))
 
-	// Find the project root: .env and migrations/ live here.
-	// Works whether you run from the project root or the server/ subdir.
 	projectRoot, err := findProjectRoot()
 	if err != nil {
 		log.Fatalf("failed to find project root: %s", err)
@@ -58,23 +61,34 @@ func main() {
 	if err := db.Migrate(cfg.DB.DSN, "file://migrations"); err != nil {
 		slog.Error("unable to run db migrations", "error", err)
 	}
-	application := &app.Application{
-		Config:      cfg,
-		DbConnector: sqlDB,
+
+	// gRPC server
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+	if err != nil {
+		log.Fatalf("failed to listen on port %d: %s", cfg.GRPCPort, err)
 	}
 
-	application.RegisterRoutes(
-		routes.RegisterUserRoutes,
-	)
+	grpcServer := grpc.NewServer()
 
-	application.RegisterSoloRoutes(
-		routes.RegisterHealthRoutes,
-		
-	)
+	// Register services
+	usersHandler := users.NewHandler(sqlDB)
+	userspb.RegisterUsersServiceServer(grpcServer, usersHandler)
 
-	mux := application.Mount()
-	if err := application.Run(mux); err != nil {
-		log.Fatalf("Error Starting new server : %s", err)
+	// Enable reflection for tools like grpcurl and evans
+	reflection.Register(grpcServer)
+
+	// Graceful shutdown
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		slog.Info("shutting down gRPC server")
+		grpcServer.GracefulStop()
+	}()
+
+	slog.Info("gRPC server listening", "addr", lis.Addr().String())
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("gRPC server error: %s", err)
 	}
 }
 

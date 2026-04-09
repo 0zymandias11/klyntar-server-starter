@@ -1,0 +1,31 @@
+syntax = "proto3";
+package klyntar.users.v1;
+
+option go_package = "example.com/klyntar-server/gen/pb/users/v1";
+
+service UsersService {
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+}
+
+message GetUserRequest {
+  string key_fingerprint = 1;
+}
+
+message CreateUserRequest {
+  string username = 1;
+  string email = 2;
+  string key_fingerprint = 3;
+  string device_mac = 4;
+}
+
+message CreateUserResponse {
+  string id = 1;
+}
+
+message User {
+  string id = 1;
+  string username = 2;
+  string email = 3;
+  string device_mac = 4;
+}
