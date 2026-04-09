@@ -1,0 +1,15 @@
+[build]
+  # Entry point — matches your server/main.go location
+  cmd        = "go build -o ./tmp/server ./server"
+  bin        = "./tmp/server"
+  # Rebuild when any .go file changes (excluding generated proto files)
+  include_ext = ["go"]
+  exclude_dir = ["tmp", "gen", "migrations"]
+  # Pass these through to the running binary
+  args_bin = []
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true

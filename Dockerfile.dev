@@ -1,0 +1,92 @@
+# Dockerfile.dev — development environment with all tooling pre-installed.
+#
+# This is NOT used in production. It gives you a reproducible shell where
+# every tool (sqlc, buf, golangci-lint, etc.) is already installed, so you
+# don't need to install anything on your Windows host.
+#
+# Build:  docker build -f Dockerfile.dev -t klyntar-dev .
+# Run:    docker run --rm -it -v ${PWD}:/app --network host klyntar-dev
+#         (--network host lets the container reach Postgres + Redis on localhost)
+
+FROM golang:1.25-alpine
+
+# ── 1. System packages ────────────────────────────────────────────────────────
+# These come from Alpine's package manager (apk).
+# postgresql16-client  → gives you the `psql` CLI to inspect your database
+# redis               → gives you the `redis-cli` CLI to inspect Redis
+# bash, curl, git, make, ca-certificates → needed by installer scripts below
+RUN apk add --no-cache \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    make \
+    postgresql16-client \
+    redis
+
+# ── 2. Version pins ───────────────────────────────────────────────────────────
+# Change a version here and rebuild the image to upgrade a tool.
+ARG SQLC_VERSION=1.27.0
+ARG BUF_VERSION=1.50.0
+ARG GOLANGCI_VERSION=1.62.2
+ARG MIGRATE_VERSION=4.18.1
+ARG GRPCURL_VERSION=1.9.2
+
+# ── 3. sqlc ───────────────────────────────────────────────────────────────────
+# sqlc reads your SQL queries and generates type-safe Go functions so you never
+# write manual row-scanning code. You run it whenever you add/change a query.
+# Docs: https://docs.sqlc.dev
+RUN curl -sSfL \
+    "https://github.com/sqlc-dev/sqlc/releases/download/v${SQLC_VERSION}/sqlc_${SQLC_VERSION}_linux_amd64.tar.gz" \
+    | tar -xz -C /usr/local/bin sqlc
+
+# ── 4. buf ────────────────────────────────────────────────────────────────────
+# buf generates Go code from your .proto files (the gRPC contract).
+# Run `buf generate` after editing any .proto file.
+# Docs: https://buf.build/docs
+RUN curl -sSfL \
+    "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64" \
+    -o /usr/local/bin/buf \
+    && chmod +x /usr/local/bin/buf
+
+# ── 5. golangci-lint ──────────────────────────────────────────────────────────
+# Runs many Go linters at once. Catches bugs, style issues, and unused code.
+# Run `golangci-lint run ./...` before committing.
+# Docs: https://golangci-lint.run
+RUN curl -sSfL \
+    https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+    | bash -s -- -b /usr/local/bin v${GOLANGCI_VERSION}
+
+# ── 6. golang-migrate CLI ─────────────────────────────────────────────────────
+# Runs your SQL migration files (the ones in /migrations) against a real DB.
+# Usage: migrate -database $DATABASE_URL -path migrations up
+# Docs: https://github.com/golang-migrate/migrate
+RUN curl -sSfL \
+    "https://github.com/golang-migrate/migrate/releases/download/v${MIGRATE_VERSION}/migrate.linux-amd64.tar.gz" \
+    | tar -xz -C /usr/local/bin migrate
+
+# ── 7. grpcurl ───────────────────────────────────────────────────────────────
+# Like `curl` but for gRPC. Lets you call your gRPC server from the command line
+# to test it without writing a client first.
+# Usage: grpcurl -plaintext localhost:50051 list
+# Docs: https://github.com/fullstorydev/grpcurl
+RUN curl -sSfL \
+    "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" \
+    | tar -xz -C /usr/local/bin grpcurl
+
+# ── 8. Go-based tools (installed via `go install`) ────────────────────────────
+# These are Go programs that get compiled and placed in /go/bin (already on PATH).
+
+# evans: interactive gRPC REPL — like a browser devtools for your gRPC server.
+# Usage: evans --host localhost --port 50051 --reflection repl
+RUN go install github.com/ktr0731/evans@latest
+
+# air: hot-reload for Go. Watches your files and restarts the server on save.
+# Usage: air  (run this instead of `go run ./cmd/server`)
+RUN go install github.com/air-verse/air@latest
+
+# ── 9. Working directory ──────────────────────────────────────────────────────
+# Your project files will be mounted here via -v ${PWD}:/app
+WORKDIR /app
+
+CMD ["bash"]

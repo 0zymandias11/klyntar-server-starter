@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-klyntar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-klyntar}
+      POSTGRES_DB: ${POSTGRES_DB:-klyntar}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-klyntar}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  klyntar-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-klyntar}:${POSTGRES_PASSWORD:-klyntar}@postgres:5432/${POSTGRES_DB:-klyntar}?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      GRPC_PORT: 50051
+    ports:
+      - "50051:50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  klyntar:
+    build:
+      context: ../klyntar
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVER_ADDR: klyntar-server:50051
+      SSH_PORT: 2222
+      HOST_KEY_PATH: /etc/klyntar/host_key
+    ports:
+      - "2222:2222"
+    volumes:
+      - klyntar_keys:/etc/klyntar
+    depends_on:
+      - klyntar-server
+
+volumes:
+  postgres_data:
+  redis_data:
+  klyntar_keys:
